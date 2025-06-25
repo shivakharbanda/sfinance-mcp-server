@@ -11,6 +11,7 @@ import mcp.server.stdio
 
 # Import your classes
 from sfinance.sfinance import SFinance
+from sfinance.exceptions import TickerNotFound
 
 # Create server
 server = Server("sfinance-server")
@@ -54,6 +55,8 @@ def get_ticker(symbol: str):
     start_time = time.time()
     
     sf_instance = get_sfinance()
+
+
     ticker = sf_instance.ticker(symbol)
     
     end_time = time.time()
@@ -191,6 +194,20 @@ async def list_tools() -> List[types.Tool]:
             }
         ),
         types.Tool(
+            name="get_peer_comparison",
+            description="Get peer comparison analysis for Indian companies. Compares the company with its industry peers on key financial metrics like P/E ratio, market cap, revenue growth, etc.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string", 
+                        "description": "Indian stock symbol (e.g., INFY, TCS, RELIANCE, HDFCBANK)"
+                    }
+                },
+                "required": ["symbol"]
+            }
+        ),
+        types.Tool(
             name="get_cache_stats",
             description="Get ticker cache statistics and performance info",
             inputSchema={
@@ -274,10 +291,18 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
         elif name == "get_shareholding":
             df = ticker.get_shareholding()
             return [types.TextContent(type="text", text=df_to_json(df))]
-        
+        elif name == "get_peer_comparison":
+            df = ticker.get_peer_comparison()
+            return [types.TextContent(type="text", text=df_to_json(df))]
         else:
             raise ValueError(f"Unknown tool: {name}")
-            
+    except TickerNotFound as e:
+        error_msg = {
+            "error": "Ticker not found",
+            "message": str(e),
+            "suggestion": "Please verify the stock symbol is correct and listed on NSE/BSE"
+        }
+        return [types.TextContent(type="text", text=json.dumps(error_msg, indent=2))]
     except Exception as e:
         import traceback
         error_msg = {
