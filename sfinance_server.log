@@ -1,5 +1,0 @@
-2025-06-26 17:41:39,680 - mcp.server.lowlevel.server - INFO - Processing request of type ListToolsRequest
-2025-06-26 17:41:39,681 - mcp.server.lowlevel.server - INFO - Processing request of type ListToolsRequest
-2025-06-26 17:41:39,682 - mcp.server.lowlevel.server - INFO - Processing request of type ListResourcesRequest
-2025-06-26 17:41:39,694 - mcp.server.lowlevel.server - INFO - Processing request of type ListPromptsRequest
-2025-06-26 17:42:13,573 - mcp.server.lowlevel.server - INFO - Processing request of type CallToolRequest
