@@ -421,14 +421,125 @@ async def list_tools() -> List[types.Tool]:
                 "type": "object",
                 "properties": {
                     "symbol": {
-                        "type": "string", 
+                        "type": "string",
                         "description": "Indian stock symbol (e.g., INFY, TCS, RELIANCE, HDFCBANK)"
                     }
                 },
                 "required": ["symbol"]
             }
         ),
-        
+
+        # Document access tools (login required)
+        types.Tool(
+            name="get_announcements",
+            description="Get company announcements for an Indian stock. Login required. Returns title, subtitle, and URL for each announcement.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Indian stock symbol (e.g., INFY, TCS, RELIANCE)"
+                    },
+                    "tab": {
+                        "type": "string",
+                        "description": "Announcement tab: 'recent' (default) or 'important'",
+                        "enum": ["recent", "important"],
+                        "default": "recent"
+                    }
+                },
+                "required": ["symbol"]
+            }
+        ),
+        types.Tool(
+            name="get_annual_reports",
+            description="Get list of annual reports for an Indian stock with download URLs. Login required.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Indian stock symbol (e.g., INFY, TCS, RELIANCE)"
+                    }
+                },
+                "required": ["symbol"]
+            }
+        ),
+        types.Tool(
+            name="get_credit_ratings",
+            description="Get credit rating documents for an Indian stock with download URLs. Login required.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Indian stock symbol (e.g., INFY, TCS, RELIANCE)"
+                    }
+                },
+                "required": ["symbol"]
+            }
+        ),
+        types.Tool(
+            name="get_concalls",
+            description="Get conference call (concall) documents for an Indian stock — transcripts, PPTs, and recordings with URLs. Login required.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Indian stock symbol (e.g., INFY, TCS, RELIANCE)"
+                    }
+                },
+                "required": ["symbol"]
+            }
+        ),
+        types.Tool(
+            name="download_documents",
+            description="Batch download company documents (announcements, annual reports, credit ratings, or concalls) to a local folder. Login required.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Indian stock symbol (e.g., INFY, TCS, RELIANCE)"
+                    },
+                    "doc_type": {
+                        "type": "string",
+                        "description": "Type of documents to download",
+                        "enum": ["announcements", "annual_reports", "credit_ratings", "concalls"]
+                    },
+                    "folder_path": {
+                        "type": "string",
+                        "description": "Local folder path to save downloaded documents (e.g., 'C:\\Downloads\\INFY')"
+                    },
+                    "link_type": {
+                        "type": "string",
+                        "description": "For concalls: which link type to download — 'transcript', 'ppt', 'rec', or 'all' (default)",
+                        "enum": ["transcript", "ppt", "rec", "all"],
+                        "default": "all"
+                    },
+                    "tab": {
+                        "type": "string",
+                        "description": "For announcements: 'recent' (default) or 'important'",
+                        "enum": ["recent", "important"],
+                        "default": "recent"
+                    },
+                    "year": {
+                        "type": "integer",
+                        "description": "For annual_reports: filter by year (e.g., 2023)"
+                    },
+                    "period": {
+                        "type": "string",
+                        "description": "For concalls: filter by period string (e.g., 'Q3 2024')"
+                    },
+                    "n": {
+                        "type": "integer",
+                        "description": "Maximum number of documents to download"
+                    }
+                },
+                "required": ["symbol", "doc_type", "folder_path"]
+            }
+        ),
+
         # New screener tools
         types.Tool(
             name="screen_stocks",
@@ -658,7 +769,50 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
             elif name == "get_peer_comparison":
                 df = ticker.get_peer_comparison()
                 return [types.TextContent(type="text", text=df_to_json(df))]
-            
+
+            elif name == "get_announcements":
+                tab = arguments.get("tab", "recent")
+                df = ticker.get_announcements(tab=tab)
+                return [types.TextContent(type="text", text=df_to_json(df))]
+
+            elif name == "get_annual_reports":
+                df = ticker.get_annual_reports()
+                return [types.TextContent(type="text", text=df_to_json(df))]
+
+            elif name == "get_credit_ratings":
+                df = ticker.get_credit_ratings()
+                return [types.TextContent(type="text", text=df_to_json(df))]
+
+            elif name == "get_concalls":
+                df = ticker.get_concalls()
+                return [types.TextContent(type="text", text=df_to_json(df))]
+
+            elif name == "download_documents":
+                doc_type = arguments["doc_type"]
+                folder_path = arguments["folder_path"]
+                link_type = arguments.get("link_type", "all")
+                tab = arguments.get("tab", "recent")
+                year = arguments.get("year")
+                period = arguments.get("period")
+                n = arguments.get("n")
+                downloaded = ticker.download_documents(
+                    doc_type=doc_type,
+                    folder_path=folder_path,
+                    link_type=link_type,
+                    tab=tab,
+                    year=year,
+                    period=period,
+                    n=n
+                )
+                result = {
+                    "symbol": symbol,
+                    "doc_type": doc_type,
+                    "folder_path": folder_path,
+                    "downloaded_count": len(downloaded),
+                    "files": downloaded
+                }
+                return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+
             else:
                 raise ValueError(f"Unknown tool: {name}")
                 

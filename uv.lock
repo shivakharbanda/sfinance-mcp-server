@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.11.6"
 resolution-markers = [
     "python_full_version >= '3.12'",
@@ -516,7 +516,7 @@ wheels = [
 
 [[package]]
 name = "sfinance"
-version = "0.1.3"
+version = "0.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -524,9 +524,9 @@ dependencies = [
     { name = "pandas" },
     { name = "selenium" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4b/fb/7ec810f1a3d51ae3eb242bb897c9f7fa5bc96afd42e4b80bcc51c339771d/sfinance-0.1.3.tar.gz", hash = "sha256:8f80aaeb86b451173088f9b344b2f27a01a0bb5b00e056d12f35f2b740815f4c", size = 12782, upload-time = "2025-06-24T13:19:35.568Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/64/e7/55902ff456dee6b26a79e2ba3dae2a39c93dc192e6b0760b78f1f4732dc1/sfinance-0.2.0.tar.gz", hash = "sha256:83a8720e6ab7f57629ce1cd5a4bdf3e76519becf6ed684c7e5c2f646dff7fabc", size = 18859, upload-time = "2026-03-30T07:02:31.079Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/88/85/90fdcf74f21cbb825f0e5e6d2e25ef37499b790fb334c28e42b3e168d65e/sfinance-0.1.3-py3-none-any.whl", hash = "sha256:88f741f63b63c870e1055f7c8a89ee76bc1f01f1b8a58464299a98a2324a5685", size = 6595, upload-time = "2025-06-24T13:19:33.98Z" },
+    { url = "https://files.pythonhosted.org/packages/df/02/547eddbe1ad6610f79079b0cd8bd506e31dcfd20bf9a22c35535ea35b534/sfinance-0.2.0-py3-none-any.whl", hash = "sha256:43ba26221f13defec59eef878a1cb5248a35fba3749910001824d898f68a0e6e", size = 11462, upload-time = "2026-03-30T07:02:29.78Z" },
 ]
 
 [[package]]
@@ -543,7 +543,7 @@ dependencies = [
 requires-dist = [
     { name = "mcp", extras = ["cli"], specifier = ">=1.9.4" },
     { name = "pandas", specifier = ">=2.3.0" },
-    { name = "sfinance", specifier = "==0.1.3" },
+    { name = "sfinance", specifier = "==0.2.0" },
 ]
 
 [[package]]
