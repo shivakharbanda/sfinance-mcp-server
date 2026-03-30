@@ -1,10 +1,13 @@
 # SFinance MCP Server
 
-A Model Context Protocol (MCP) server that provides access to Indian stock market data.Built on top of the [SFinance package](https://github.com/shivakharbanda/sfinance).
+A Model Context Protocol (MCP) server that provides access to Indian stock market data. Built on top of the [SFinance package](https://github.com/shivakharbanda/sfinance).
+
+Supports both **stdio** (Claude Desktop) and **HTTP** transports.
 
 ## Prerequisites
 
-- Python 3.8 or higher
+- Python 3.11.6 or higher
+- [uv](https://docs.astral.sh/uv/) package manager
 - Google Chrome browser
 - Screener.in account
 
@@ -14,25 +17,11 @@ A Model Context Protocol (MCP) server that provides access to Indian stock marke
    ```bash
    git clone https://github.com/shivakharbanda/sfinance-mcp-server.git
    cd sfinance-mcp-server
-   python -m venv .venv
+   uv sync
    ```
 
-2. **Activate virtual environment**
-   ```bash
-   # Windows
-   .venv\Scripts\activate
-   
-   # macOS/Linux
-   source .venv/bin/activate
-   ```
-
-3. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Environment variables**
-   Create `.env` file in project root:
+2. **Environment variables**
+   Create a `.env` file in the project root:
    ```
    SCREENER_EMAIL=your-email@example.com
    SCREENER_PASSWORD=YourPassword123
@@ -40,19 +29,48 @@ A Model Context Protocol (MCP) server that provides access to Indian stock marke
    SCREENER_URL=https://www.screener.in/
    ```
 
-## Configuration Options
+## Running the Server
 
-### Option 1: Virtual Environment Activation (Recommended)
+### HTTP mode (remote / API access)
+
+```bash
+uv run python sfinance_server.py --transport http
+```
+
+The server starts at `http://0.0.0.0:8000/mcp`.
+
+Custom host/port:
+```bash
+uv run python sfinance_server.py --transport http --host 127.0.0.1 --port 9000
+```
+
+Or via environment variables:
+```bash
+TRANSPORT=http HOST=0.0.0.0 PORT=8000 uv run python sfinance_server.py
+```
+
+Health check endpoint: `GET http://localhost:8000/health`
+
+### Stdio mode (Claude Desktop)
+
+```bash
+uv run python sfinance_server.py
+```
+
+## Claude Desktop Configuration
+
+### Option 1: uv run (Recommended)
 
 **Windows:**
 ```json
 {
   "mcpServers": {
     "sfinance": {
-      "command": "cmd",
+      "command": "uv",
       "args": [
-        "/c",
-        "cd /d C:\\path\\to\\your\\project\\sfinance-mcp-server && .venv\\Scripts\\activate && python sfinance_server.py"
+        "run",
+        "--directory", "C:\\path\\to\\sfinance-mcp-server",
+        "python", "sfinance_server.py"
       ],
       "env": {
         "SCREENER_EMAIL": "your-email@example.com",
@@ -70,10 +88,11 @@ A Model Context Protocol (MCP) server that provides access to Indian stock marke
 {
   "mcpServers": {
     "sfinance": {
-      "command": "bash",
+      "command": "uv",
       "args": [
-        "-c",
-        "cd /path/to/your/project/sfinance-mcp-server && source .venv/bin/activate && python sfinance_server.py"
+        "run",
+        "--directory", "/path/to/sfinance-mcp-server",
+        "python", "sfinance_server.py"
       ],
       "env": {
         "SCREENER_EMAIL": "your-email@example.com",
@@ -86,43 +105,14 @@ A Model Context Protocol (MCP) server that provides access to Indian stock marke
 }
 ```
 
-### Option 2: Direct Python Path
+### Option 2: HTTP transport (connect to a running server)
 
-**Windows:**
+If you already have the server running in HTTP mode, point Claude Desktop at it:
 ```json
 {
   "mcpServers": {
     "sfinance": {
-      "command": "C:\\path\\to\\your\\project\\sfinance-mcp-server\\.venv\\Scripts\\python.exe",
-      "args": [
-        "C:\\path\\to\\your\\project\\sfinance-mcp-server\\sfinance_server.py"
-      ],
-      "env": {
-        "SCREENER_EMAIL": "your-email@example.com",
-        "SCREENER_PASSWORD": "YourPassword123",
-        "CHROME_PATH": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-        "SCREENER_URL": "https://www.screener.in/"
-      }
-    }
-  }
-}
-```
-
-**macOS/Linux:**
-```json
-{
-  "mcpServers": {
-    "sfinance": {
-      "command": "/path/to/your/project/sfinance-mcp-server/.venv/bin/python",
-      "args": [
-        "/path/to/your/project/sfinance-mcp-server/sfinance_server.py"
-      ],
-      "env": {
-        "SCREENER_EMAIL": "your-email@example.com",
-        "SCREENER_PASSWORD": "YourPassword123",
-        "CHROME_PATH": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "SCREENER_URL": "https://www.screener.in/"
-      }
+      "url": "http://localhost:8000/mcp"
     }
   }
 }
@@ -133,65 +123,71 @@ A Model Context Protocol (MCP) server that provides access to Indian stock marke
 - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
-## Required Changes
-
-1. Replace `C:\\path\\to\\your\\project\\sfinance-mcp-server` with your actual project path
-2. Update `SCREENER_EMAIL` and `SCREENER_PASSWORD` with your credentials
-3. Verify Chrome path matches your installation
-4. Restart Claude Desktop after configuration
-
 ## Features
 
-- **Stock Analysis**: Company overview, financial statements, quarterly results, shareholding patterns
-- **Stock Screening**: Custom queries with financial parameters and pre-built templates
-- **Indian Market Focus**: NSE/BSE listed companies
-
-## Usage
-
-### Stock Analysis
-```
-Get overview for RELIANCE
-Get income statement for TCS
-Get quarterly results for HDFCBANK
-```
-
-### Stock Screening
-```
-Screen stocks with Piotroski score > 7 AND Return on equity > 15
-Find value stocks with Price to Earning < 15 AND Dividend yield > 3
-```
+- **Stock Analysis**: Company overview, financial statements, quarterly results, shareholding patterns, peer comparison
+- **Document Access** *(login required)*: Announcements, annual reports, credit ratings, concall transcripts/PPTs
+- **Document Download** *(login required)*: Batch download any document type to a local folder
+- **Stock Screening** *(login required)*: Custom queries with financial parameters and pre-built templates
+- **Indian Market Focus**: NSE/BSE listed companies via screener.in
 
 ## Available Tools
 
 ### Stock Data
-- `get_overview` - Company overview and metrics
-- `get_income_statement` - P&L statement
-- `get_balance_sheet` - Balance sheet data
-- `get_cash_flow` - Cash flow statement
-- `get_quarterly_results` - Quarterly results
-- `get_shareholding` - Shareholding pattern
-- `get_peer_comparison` - Industry comparison
+| Tool | Description |
+|------|-------------|
+| `get_overview` | Company overview and about |
+| `get_income_statement` | P&L statement |
+| `get_balance_sheet` | Balance sheet |
+| `get_cash_flow` | Cash flow statement |
+| `get_quarterly_results` | Quarterly results |
+| `get_shareholding` | Shareholding pattern |
+| `get_peer_comparison` | Industry peer comparison |
 
-### Screening
-- `screen_stocks` - Custom stock screening
-- `get_screening_parameters` - Available parameters
+### Documents *(login required)*
+| Tool | Description |
+|------|-------------|
+| `get_announcements` | Recent or important company announcements |
+| `get_annual_reports` | Annual report list with download URLs |
+| `get_credit_ratings` | Credit rating documents |
+| `get_concalls` | Concall transcripts, PPTs, and recordings |
+| `download_documents` | Batch download documents to a local folder |
+
+### Screening *(login required)*
+| Tool | Description |
+|------|-------------|
+| `screen_stocks` | Custom stock screening with financial criteria |
+| `get_screening_parameters` | Browse available screening parameters |
 
 ### Utilities
-- `check_login_status` - Verify login status
-- `get_cache_stats` - Cache information
-- `clear_cache` - Clear cache
+| Tool | Description |
+|------|-------------|
+| `check_login_status` | Verify screener.in login |
+| `get_cache_stats` | Cache information |
+| `clear_cache` | Clear ticker cache |
+
+## Usage Examples
+
+```
+Get overview for RELIANCE
+Get income statement for TCS
+Get concalls for INFY
+Download the last 3 annual reports for HDFCBANK to C:\Downloads\HDFCBANK
+Screen stocks with Piotroski score > 7 AND Return on equity > 15
+Find value stocks with Price to Earning < 15 AND Dividend yield > 3
+```
 
 ## Prompt Templates
 
-- **High Quality Stocks** - Strong fundamentals
-- **Value Stocks** - Undervalued opportunities  
-- **Growth Stocks** - High-growth companies
+- **High Quality Stocks** - Strong fundamentals (Piotroski, ROE, P/E)
+- **Value Stocks** - Undervalued opportunities (P/E, P/B, dividend yield)
+- **Growth Stocks** - High-growth companies (sales/profit growth, ROE)
 - **Custom Screener** - Build your own criteria
 
 ## Dependencies
 
-- [SFinance](https://github.com/shivakharbanda/sfinance) - Core library
-- MCP - Model Context Protocol
+- [sfinance](https://github.com/shivakharbanda/sfinance) - Core data library
+- [fastmcp](https://gofastmcp.com) - MCP server framework (stdio + HTTP)
 - pandas - Data handling
 - python-dotenv - Environment variables
 
@@ -205,6 +201,6 @@ For educational purposes only. Always verify financial data from official source
 
 ## Legal Notice
 
-⚠️ **Users are solely responsible for ensuring that their use of this software complies with the terms of service of any website they access.**
+**Users are solely responsible for ensuring that their use of this software complies with the terms of service of any website they access.**
 
 **This project is not affiliated with, endorsed by, or sponsored by Screener.in, Mittal Analytics Private Limited, or any other third-party data provider.**

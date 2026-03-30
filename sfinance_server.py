@@ -1,27 +1,26 @@
 import json
-import asyncio
 import os
-from typing import List, Dict, Any, Optional
-import pandas as pd
 import time
+import argparse
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from typing import Optional, Literal
+import pandas as pd
 
-import mcp.types as types
-from mcp.server import Server
-import mcp.server.stdio
+from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
-# Import your classes
 from sfinance.sfinance import SFinance
 from sfinance.exceptions import TickerNotFound, LoginRequiredError
 
 from constants import SCREENER_PARAMS, SCREENER_OPERATORS
 
-from dotenv import load_dotenv  # Add this import
-load_dotenv()  # Add this line
+from dotenv import load_dotenv
+load_dotenv()
 
 import logging
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -32,820 +31,485 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Shared state — populated once during lifespan, reused by all tool calls
+# ---------------------------------------------------------------------------
 
-# Create server
-server = Server("sfinance-server")
+app_state: dict = {}
+CACHE_EXPIRY_HOURS = 24
 
-# Global SFinance instance - initialize lazily
-sf = None
 
-# Ticker cache with expiration
-ticker_cache = {}
-CACHE_EXPIRY_HOURS = 24  # Cache tickers for 24 hours
+# ---------------------------------------------------------------------------
+# Lifespan — SFinance initializes and logs in ONCE at server startup
+# ---------------------------------------------------------------------------
 
-# Login state tracking
-_login_attempted = False
-_login_successful = False
+@asynccontextmanager
+async def lifespan(server: FastMCP):
+    chrome_path = os.getenv('CHROME_PATH', "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe")
+    screener_url = os.getenv('SCREENER_URL', "https://www.screener.in/")
 
-def get_sfinance():
-    """Lazy initialization of SFinance instance"""
-    global sf, _login_attempted, _login_successful
-    
-    if sf is None:
+    logger.info("Starting SFinance server — initializing browser...")
+    sf = SFinance(screener_url, chrome_path)
+
+    login_successful = False
+    email = os.getenv('SCREENER_EMAIL')
+    password = os.getenv('SCREENER_PASSWORD')
+    if email and password:
         try:
-            chrome_path = os.getenv('CHROME_PATH', "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe")
-            screener_url = os.getenv('SCREENER_URL', "https://www.screener.in/")
-            sf = SFinance(screener_url, chrome_path)
-            
-            # Attempt login if credentials are available
-            if not _login_attempted:
-                email = os.getenv('SCREENER_EMAIL')
-                password = os.getenv('SCREENER_PASSWORD')
-                
-                if email and password:
-                    try:
-                        sf.login(email, password)
-                        _login_successful = sf.fetcher.is_logged_in()
-                        logger.info(f"Login successful: {_login_successful}")
-                    except Exception as e:
-                        logger.error(f"Login failed: {str(e)}")
-                        _login_successful = False
-                else:
-                    logger.warning("No credentials provided in environment variables")
-                    _login_successful = False
-                
-                _login_attempted = True
-                
+            sf.login(email, password)
+            login_successful = sf.fetcher.is_logged_in()
+            logger.info(f"Login successful: {login_successful}")
         except Exception as e:
-            logger.error(f"Failed to initialize SFinance: {str(e)}")
-            raise Exception(f"Failed to initialize SFinance: {str(e)}")
-    
-    return sf
+            logger.error(f"Login failed: {e}")
+    else:
+        logger.warning("No credentials in env — running without login")
 
-def is_logged_in():
-    """Check if user is logged in for screener functionality"""
-    global _login_successful
+    app_state["sf"] = sf
+    app_state["login_successful"] = login_successful
+    app_state["ticker_cache"] = {}
+
+    yield
+
+    logger.info("Shutting down — closing browser...")
+    try:
+        sf.close()
+    except Exception as e:
+        logger.error(f"Error closing SFinance: {e}")
+
+
+# ---------------------------------------------------------------------------
+# FastMCP server instance
+# ---------------------------------------------------------------------------
+
+mcp = FastMCP("sfinance-server", lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def is_logged_in() -> bool:
+    sf = app_state.get("sf")
     if sf is not None:
         return sf.fetcher.is_logged_in()
-    return _login_successful
+    return app_state.get("login_successful", False)
+
 
 def get_ticker(symbol: str):
-    """Get ticker object with caching"""
-    global ticker_cache
-    
     symbol = symbol.upper()
-    current_time = datetime.now()
-    
-    # Check if ticker exists in cache and is not expired
-    if symbol in ticker_cache:
-        cached_ticker, cache_time = ticker_cache[symbol]
-        if current_time - cache_time < timedelta(hours=CACHE_EXPIRY_HOURS):
-            logger.info(f"Using cached ticker for {symbol}")
-            return cached_ticker
-        else:
-            logger.info(f"Cache expired for {symbol}, fetching new ticker")
-            del ticker_cache[symbol]
-    
-    # Create new ticker and cache it
-    logger.info(f"Creating new ticker for {symbol}...")
-    start_time = time.time()
-    
-    sf_instance = get_sfinance()
-    ticker = sf_instance.ticker(symbol)
-    
-    end_time = time.time()
-    logger.info(f"Ticker creation for {symbol} took {end_time - start_time:.2f} seconds")
-    
-    # Cache the ticker with current timestamp
-    ticker_cache[symbol] = (ticker, current_time)
-    
+    cache: dict = app_state["ticker_cache"]
+    now = datetime.now()
+
+    if symbol in cache:
+        ticker, cache_time = cache[symbol]
+        if now - cache_time < timedelta(hours=CACHE_EXPIRY_HOURS):
+            logger.info(f"Cache hit for {symbol}")
+            return ticker
+        logger.info(f"Cache expired for {symbol}")
+        del cache[symbol]
+
+    logger.info(f"Creating ticker for {symbol}...")
+    t0 = time.time()
+    ticker = app_state["sf"].ticker(symbol)
+    logger.info(f"Ticker {symbol} loaded in {time.time() - t0:.2f}s")
+    cache[symbol] = (ticker, now)
     return ticker
 
-def clear_expired_cache():
-    """Clear expired cache entries"""
-    global ticker_cache
-    current_time = datetime.now()
-    expired_symbols = []
-    
-    for symbol, (ticker, cache_time) in ticker_cache.items():
-        if current_time - cache_time >= timedelta(hours=CACHE_EXPIRY_HOURS):
-            expired_symbols.append(symbol)
-    
-    for symbol in expired_symbols:
-        del ticker_cache[symbol]
-        logger.info(f"Cleared expired cache for {symbol}")
 
-def get_cache_stats():
-    """Get cache statistics"""
-    current_time = datetime.now()
-    active_cache = 0
-    expired_cache = 0
-    
-    for symbol, (ticker, cache_time) in ticker_cache.items():
-        if current_time - cache_time < timedelta(hours=CACHE_EXPIRY_HOURS):
-            active_cache += 1
-        else:
-            expired_cache += 1
-    
-    stats =  {
-        "active_cache_entries": active_cache,
-        "expired_cache_entries": expired_cache,
-        "total_cache_entries": len(ticker_cache),
-        "cache_expiry_hours": CACHE_EXPIRY_HOURS,
-        "login_status": is_logged_in()
-    }
-    logger.debug(f"Cache stats: {stats}")
-    return stats
+def clear_expired_cache():
+    cache: dict = app_state.get("ticker_cache", {})
+    now = datetime.now()
+    expired = [s for s, (_, t) in cache.items()
+               if now - t >= timedelta(hours=CACHE_EXPIRY_HOURS)]
+    for s in expired:
+        del cache[s]
+        logger.info(f"Cleared expired cache for {s}")
+
 
 def df_to_json(df: pd.DataFrame) -> str:
-    """Convert DataFrame to JSON string"""
     if df.empty:
         return json.dumps({"error": "No data available"})
     return df.to_json(orient='records', indent=2)
 
-@server.list_prompts()
-async def list_prompts() -> List[types.Prompt]:
-    """List available prompt templates for stock screening"""
-    return [
-        types.Prompt(
-            name="high_quality_stocks",
-            description="Find high quality stocks with strong fundamentals",
-            arguments=[
-                types.PromptArgument(
-                    name="min_piotroski_score",
-                    description="Minimum Piotroski score (0-9, default: 7)",
-                    required=False
-                ),
-                types.PromptArgument(
-                    name="min_roe",
-                    description="Minimum Return on Equity percentage (default: 15)",
-                    required=False
-                ),
-                types.PromptArgument(
-                    name="max_pe",
-                    description="Maximum P/E ratio (default: 25)",
-                    required=False
-                )
-            ]
-        ),
-        types.Prompt(
-            name="value_stocks",
-            description="Find undervalued stocks based on traditional value metrics",
-            arguments=[
-                types.PromptArgument(
-                    name="max_pe",
-                    description="Maximum P/E ratio (default: 15)",
-                    required=False
-                ),
-                types.PromptArgument(
-                    name="max_pb",
-                    description="Maximum Price to Book ratio (default: 2)",
-                    required=False
-                ),
-                types.PromptArgument(
-                    name="min_dividend_yield",
-                    description="Minimum dividend yield percentage (default: 2)",
-                    required=False
-                )
-            ]
-        ),
-        types.Prompt(
-            name="growth_stocks",
-            description="Find growth stocks with strong revenue and profit growth",
-            arguments=[
-                types.PromptArgument(
-                    name="min_sales_growth",
-                    description="Minimum sales growth 3 years percentage (default: 15)",
-                    required=False
-                ),
-                types.PromptArgument(
-                    name="min_profit_growth",
-                    description="Minimum profit growth 3 years percentage (default: 20)",
-                    required=False
-                ),
-                types.PromptArgument(
-                    name="min_roe",
-                    description="Minimum Return on Equity percentage (default: 15)",
-                    required=False
-                )
-            ]
-        ),
-        types.Prompt(
-            name="custom_screener",
-            description="Build a custom stock screening query with your own criteria",
-            arguments=[
-                types.PromptArgument(
-                    name="criteria",
-                    description="Describe the screening criteria you want (e.g., 'stocks with high ROE and low debt')",
-                    required=True
-                )
-            ]
-        )
-    ]
 
-@server.get_prompt()
-async def get_prompt(name: str, arguments: Dict[str, str] | None) -> types.GetPromptResult:
-    """Get specific prompt template"""
-    
-    if name == "high_quality_stocks":
-        min_piotroski = arguments.get("min_piotroski_score", "7") if arguments else "7"
-        min_roe = arguments.get("min_roe", "15") if arguments else "15"
-        max_pe = arguments.get("max_pe", "25") if arguments else "25"
-        
-        query = f"Piotroski score > {min_piotroski} AND Return on equity > {min_roe} AND Price to Earning < {max_pe}"
-        
-        return types.GetPromptResult(
-            description="Screen for high quality stocks with strong fundamentals",
-            messages=[
-                types.PromptMessage(
-                    role="user",
-                    content=types.TextContent(
-                        type="text",
-                        text=f"Please screen for high quality stocks using this query: {query}\n\nThis will find companies with:\n- Piotroski score > {min_piotroski} (financial strength)\n- Return on equity > {min_roe}% (profitability)\n- P/E ratio < {max_pe} (reasonable valuation)"
-                    )
-                )
-            ]
-        )
-    
-    elif name == "value_stocks":
-        max_pe = arguments.get("max_pe", "15") if arguments else "15"
-        max_pb = arguments.get("max_pb", "2") if arguments else "2"
-        min_dividend = arguments.get("min_dividend_yield", "2") if arguments else "2"
-        
-        query = f"Price to Earning < {max_pe} AND Price to book value < {max_pb} AND Dividend yield > {min_dividend}"
-        
-        return types.GetPromptResult(
-            description="Screen for undervalued stocks",
-            messages=[
-                types.PromptMessage(
-                    role="user",
-                    content=types.TextContent(
-                        type="text",
-                        text=f"Please screen for value stocks using this query: {query}\n\nThis will find companies with:\n- P/E ratio < {max_pe} (low valuation)\n- Price to book < {max_pb} (trading below book value)\n- Dividend yield > {min_dividend}% (income generating)"
-                    )
-                )
-            ]
-        )
-    
-    elif name == "growth_stocks":
-        min_sales_growth = arguments.get("min_sales_growth", "15") if arguments else "15"
-        min_profit_growth = arguments.get("min_profit_growth", "20") if arguments else "20"
-        min_roe = arguments.get("min_roe", "15") if arguments else "15"
-        
-        query = f"Sales growth 3Years > {min_sales_growth} AND Profit growth 3Years > {min_profit_growth} AND Return on equity > {min_roe}"
-        
-        return types.GetPromptResult(
-            description="Screen for growth stocks",
-            messages=[
-                types.PromptMessage(
-                    role="user",
-                    content=types.TextContent(
-                        type="text",
-                        text=f"Please screen for growth stocks using this query: {query}\n\nThis will find companies with:\n- Sales growth > {min_sales_growth}% (3 years)\n- Profit growth > {min_profit_growth}% (3 years)\n- Return on equity > {min_roe}% (efficient capital use)"
-                    )
-                )
-            ]
-        )
-    
-    elif name == "custom_screener":
-        criteria = arguments.get("criteria", "") if arguments else ""
-        
-        return types.GetPromptResult(
-            description="Build custom screening query",
-            messages=[
-                types.PromptMessage(
-                    role="user",
-                    content=types.TextContent(
-                        type="text",
-                        text=f"Based on your criteria: '{criteria}'\n\nPlease help me build a custom stock screening query. Here are the available parameters:\n\n**Financial Ratios**: Price to Earning, Price to book value, Return on equity, Return on assets, Debt to equity, Current ratio, Quick ratio\n\n**Growth Metrics**: Sales growth 3Years, Profit growth 3Years, EPS growth 3Years, Sales growth 5Years\n\n**Profitability**: OPM (Operating Profit Margin), NPM (Net Profit Margin), Return on capital employed\n\n**Quality Scores**: Piotroski score, Earnings yield\n\n**Market Data**: Market Capitalization, Dividend yield, Promoter holding\n\n**Operators**: >, <, AND, OR\n\nExample: 'Return on equity > 20 AND Debt to equity < 0.5 AND Sales growth 3Years > 15'"
-                    )
-                )
-            ]
-        )
-    
-    else:
-        raise ValueError(f"Unknown prompt: {name}")
+# ---------------------------------------------------------------------------
+# Tools — ticker data
+# ---------------------------------------------------------------------------
 
-@server.list_tools()
-async def list_tools() -> List[types.Tool]:
-    return [
-        # Existing tools (unchanged)
-        types.Tool(
-            name="get_overview",
-            description="Get company overview for Indian stocks listed on NSE/BSE. Use Indian stock symbols like INFY, TCS, RELIANCE, etc.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "symbol": {
-                        "type": "string", 
-                        "description": "Indian stock symbol (e.g., INFY, TCS, RELIANCE, HDFCBANK)"
-                    }
-                },
-                "required": ["symbol"]
-            }
-        ),
-        types.Tool(
-            name="get_income_statement", 
-            description="Get income statement for Indian companies. Data sourced from screener.in",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "symbol": {
-                        "type": "string", 
-                        "description": "Indian stock symbol (e.g., INFY, TCS, RELIANCE)"
-                    }
-                },
-                "required": ["symbol"]
-            }
-        ),
-        types.Tool(
-            name="get_balance_sheet",
-            description="Get balance sheet for Indian companies listed on NSE/BSE", 
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "symbol": {
-                        "type": "string", 
-                        "description": "Indian stock symbol (e.g., INFY, TCS, RELIANCE)"
-                    }
-                },
-                "required": ["symbol"]
-            }
-        ),
-        types.Tool(
-            name="get_cash_flow",
-            description="Get cash flow statement for Indian companies",
-            inputSchema={
-                "type": "object", 
-                "properties": {
-                    "symbol": {
-                        "type": "string", 
-                        "description": "Indian stock symbol (e.g., INFY, TCS, RELIANCE)"
-                    }
-                },
-                "required": ["symbol"]
-            }
-        ),
-        types.Tool(
-            name="get_quarterly_results",
-            description="Get quarterly results for Indian companies from screener.in",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "symbol": {
-                        "type": "string", 
-                        "description": "Indian stock symbol (e.g., INFY, TCS, RELIANCE)"
-                    }
-                },
-                "required": ["symbol"]
-            }
-        ),
-        types.Tool(
-            name="get_shareholding",
-            description="Get shareholding pattern for Indian companies (promoter, institutional, public holdings)",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "symbol": {
-                        "type": "string", 
-                        "description": "Indian stock symbol (e.g., INFY, TCS, RELIANCE)"
-                    }
-                },
-                "required": ["symbol"]
-            }
-        ),
-        types.Tool(
-            name="get_peer_comparison",
-            description="Get peer comparison analysis for Indian companies. Compares the company with its industry peers on key financial metrics like P/E ratio, market cap, revenue growth, etc.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "symbol": {
-                        "type": "string",
-                        "description": "Indian stock symbol (e.g., INFY, TCS, RELIANCE, HDFCBANK)"
-                    }
-                },
-                "required": ["symbol"]
-            }
-        ),
+@mcp.tool()
+async def get_overview(symbol: str) -> str:
+    """Get company overview for an Indian stock listed on NSE/BSE. E.g. INFY, TCS, RELIANCE."""
+    clear_expired_cache()
+    ticker = get_ticker(symbol)
+    return json.dumps(ticker.get_overview(), indent=2)
 
-        # Document access tools (login required)
-        types.Tool(
-            name="get_announcements",
-            description="Get company announcements for an Indian stock. Login required. Returns title, subtitle, and URL for each announcement.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "symbol": {
-                        "type": "string",
-                        "description": "Indian stock symbol (e.g., INFY, TCS, RELIANCE)"
-                    },
-                    "tab": {
-                        "type": "string",
-                        "description": "Announcement tab: 'recent' (default) or 'important'",
-                        "enum": ["recent", "important"],
-                        "default": "recent"
-                    }
-                },
-                "required": ["symbol"]
-            }
-        ),
-        types.Tool(
-            name="get_annual_reports",
-            description="Get list of annual reports for an Indian stock with download URLs. Login required.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "symbol": {
-                        "type": "string",
-                        "description": "Indian stock symbol (e.g., INFY, TCS, RELIANCE)"
-                    }
-                },
-                "required": ["symbol"]
-            }
-        ),
-        types.Tool(
-            name="get_credit_ratings",
-            description="Get credit rating documents for an Indian stock with download URLs. Login required.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "symbol": {
-                        "type": "string",
-                        "description": "Indian stock symbol (e.g., INFY, TCS, RELIANCE)"
-                    }
-                },
-                "required": ["symbol"]
-            }
-        ),
-        types.Tool(
-            name="get_concalls",
-            description="Get conference call (concall) documents for an Indian stock — transcripts, PPTs, and recordings with URLs. Login required.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "symbol": {
-                        "type": "string",
-                        "description": "Indian stock symbol (e.g., INFY, TCS, RELIANCE)"
-                    }
-                },
-                "required": ["symbol"]
-            }
-        ),
-        types.Tool(
-            name="download_documents",
-            description="Batch download company documents (announcements, annual reports, credit ratings, or concalls) to a local folder. Login required.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "symbol": {
-                        "type": "string",
-                        "description": "Indian stock symbol (e.g., INFY, TCS, RELIANCE)"
-                    },
-                    "doc_type": {
-                        "type": "string",
-                        "description": "Type of documents to download",
-                        "enum": ["announcements", "annual_reports", "credit_ratings", "concalls"]
-                    },
-                    "folder_path": {
-                        "type": "string",
-                        "description": "Local folder path to save downloaded documents (e.g., 'C:\\Downloads\\INFY')"
-                    },
-                    "link_type": {
-                        "type": "string",
-                        "description": "For concalls: which link type to download — 'transcript', 'ppt', 'rec', or 'all' (default)",
-                        "enum": ["transcript", "ppt", "rec", "all"],
-                        "default": "all"
-                    },
-                    "tab": {
-                        "type": "string",
-                        "description": "For announcements: 'recent' (default) or 'important'",
-                        "enum": ["recent", "important"],
-                        "default": "recent"
-                    },
-                    "year": {
-                        "type": "integer",
-                        "description": "For annual_reports: filter by year (e.g., 2023)"
-                    },
-                    "period": {
-                        "type": "string",
-                        "description": "For concalls: filter by period string (e.g., 'Q3 2024')"
-                    },
-                    "n": {
-                        "type": "integer",
-                        "description": "Maximum number of documents to download"
-                    }
-                },
-                "required": ["symbol", "doc_type", "folder_path"]
-            }
-        ),
 
-        # New screener tools
-        types.Tool(
-            name="screen_stocks",
-            description="Screen Indian stocks based on financial criteria. Login required. Use criteria like 'Piotroski score > 7', 'Return on equity > 15', etc. Supported operators: +, -, /, *, >, <, AND, OR",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Screening query using financial parameters (e.g., 'Piotroski score > 7 AND Return on equity > 15')"
-                    },
-                    "sort": {
-                        "type": "string",
-                        "description": "Sort by parameter (e.g., 'Market Capitalization', 'Return on equity')",
-                        "default": ""
-                    },
-                    "order": {
-                        "type": "string",
-                        "description": "Sort order: 'asc' or 'desc'",
-                        "enum": ["asc", "desc"],
-                        "default": "desc"
-                    },
-                    "page": {
-                        "type": "integer",
-                        "description": "Page number (default: 1)",
-                        "default": 1
-                    }
-                },
-                "required": ["query"]
-            }
-        ),
-        types.Tool(
-            name="get_screening_parameters",
-            description="Get comprehensive list of available parameters for stock screening with descriptions and examples",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "category": {
-                        "type": "string",
-                        "description": "Filter by category: 'ratios', 'growth', 'profitability', 'annual', 'quarterly', 'balance_sheet', 'cash_flow', 'price'",
-                        "enum": ["ratios", "growth", "profitability", "annual", "quarterly", "balance_sheet", "cash_flow", "price", "all"]
-                    }
-                },
-                "required": []
-            }
-        ),
-        
-        # Existing cache tools
-        types.Tool(
-            name="get_cache_stats",
-            description="Get ticker cache statistics and performance info",
-            inputSchema={
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        ),
-        types.Tool(
-            name="clear_cache",
-            description="Clear all cached ticker objects (use when you want fresh data)",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "symbol": {
-                        "type": "string",
-                        "description": "Optional: specific symbol to clear from cache. If not provided, clears all cache."
-                    }
-                },
-                "required": []
-            }
-        ),
-        types.Tool(
-            name="check_login_status",
-            description="Check if logged into screener.in for advanced features",
-            inputSchema={
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        )
-    ]
+@mcp.tool()
+async def get_income_statement(symbol: str) -> str:
+    """Get income statement for an Indian company. Data sourced from screener.in."""
+    clear_expired_cache()
+    ticker = get_ticker(symbol)
+    return df_to_json(ticker.get_income_statement())
 
-@server.call_tool()
-async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextContent]:
-    """Handle tool calls"""
-    try:
-        # Handle cache management tools first
-        if name == "get_cache_stats":
-            stats = get_cache_stats()
-            return [types.TextContent(type="text", text=json.dumps(stats, indent=2))]
-        
-        elif name == "clear_cache":
-            global ticker_cache
-            symbol = arguments.get("symbol")
-            
-            if symbol:
-                symbol = symbol.upper()
-                if symbol in ticker_cache:
-                    del ticker_cache[symbol]
-                    result = {"message": f"Cleared cache for {symbol}"}
-                else:
-                    result = {"message": f"No cache found for {symbol}"}
-            else:
-                cache_count = len(ticker_cache)
-                ticker_cache.clear()
-                result = {"message": f"Cleared all cache ({cache_count} entries)"}
-            
-            return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
-        
-        elif name == "check_login_status":
-            login_status = is_logged_in()
-            result = {
-                "logged_in": login_status,
-                "message": "Logged in to screener.in" if login_status else "Not logged in. Screener functionality requires login.",
-                "note": "Set SCREENER_EMAIL and SCREENER_PASSWORD environment variables for automatic login"
-            }
-            return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
-        
-        # Handle new screener tools
-        elif name == "screen_stocks":
-              
-            query = arguments["query"]
-            sort_by = arguments.get("sort", "")
-            order = arguments.get("order", "desc")
-            page = arguments.get("page", 1)
-            
-            try:
-                sf_instance = get_sfinance()
-                if not is_logged_in():
-                    error_msg = {
-                        "error": "Login required",
-                        "message": "Stock screening requires login to screener.in",
-                        "instruction": "Set SCREENER_EMAIL and SCREENER_PASSWORD environment variables and restart the server"
-                    }
-                    return [types.TextContent(type="text", text=json.dumps(error_msg, indent=2))]
-          
-                screener = sf_instance.screener()
-                
-                df = screener.load_raw_query(
-                    query=query,
-                    sort=sort_by,
-                    order=order,
-                    page=page
-                )
-                
-                result = {
-                    "query": query,
-                    "sort": sort_by,
-                    "order": order,
-                    "page": page,
-                    "total_results": len(df),
-                    "results": df.to_dict('records') if not df.empty else []
-                }
-                
-                return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
-                
-            except Exception as e:
-                error_msg = {
-                    "error": "Screening failed",
-                    "message": str(e),
-                    "query": query
-                }
-                return [types.TextContent(type="text", text=json.dumps(error_msg, indent=2))]
-        
-        elif name == "get_screening_parameters":
-            category = arguments.get("category", "all")
-            
-            parameters = SCREENER_PARAMS
-            
-            operators_info = SCREENER_OPERATORS
-            
-            if category == "all":
-                result = {
-                    "parameters": parameters,
-                    "operators": operators_info,
-                    "note": "Use exact parameter names in queries. Case sensitive."
-                }
-            else:
-                if category in parameters:
-                    result = {
-                        "category": category,
-                        "parameters": parameters[category],
-                        "operators": operators_info
-                    }
-                else:
-                    result = {
-                        "error": f"Unknown category: {category}",
-                        "available_categories": list(parameters.keys()) + ["all"]
-                    }
-            
-            return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
-        
-        # Handle existing ticker-based tools (unchanged logic)
-        else:
-            symbol = arguments["symbol"].upper()
-            
-            # Clear expired cache periodically
-            clear_expired_cache()
-            
-            # Get ticker (from cache or create new)
-            ticker = get_ticker(symbol)
-            
-            if name == "get_overview":
-                result = ticker.get_overview()
-                return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
-            
-            elif name == "get_income_statement":
-                df = ticker.get_income_statement()
-                return [types.TextContent(type="text", text=df_to_json(df))]
-            
-            elif name == "get_balance_sheet":
-                df = ticker.get_balance_sheet()
-                return [types.TextContent(type="text", text=df_to_json(df))]
-            
-            elif name == "get_cash_flow":
-                df = ticker.get_cash_flow()
-                return [types.TextContent(type="text", text=df_to_json(df))]
-            
-            elif name == "get_quarterly_results":
-                df = ticker.get_quarterly_results()
-                return [types.TextContent(type="text", text=df_to_json(df))]
-            
-            elif name == "get_shareholding":
-                df = ticker.get_shareholding()
-                return [types.TextContent(type="text", text=df_to_json(df))]
-            
-            elif name == "get_peer_comparison":
-                df = ticker.get_peer_comparison()
-                return [types.TextContent(type="text", text=df_to_json(df))]
 
-            elif name == "get_announcements":
-                tab = arguments.get("tab", "recent")
-                df = ticker.get_announcements(tab=tab)
-                return [types.TextContent(type="text", text=df_to_json(df))]
+@mcp.tool()
+async def get_balance_sheet(symbol: str) -> str:
+    """Get balance sheet for an Indian company listed on NSE/BSE."""
+    clear_expired_cache()
+    ticker = get_ticker(symbol)
+    return df_to_json(ticker.get_balance_sheet())
 
-            elif name == "get_annual_reports":
-                df = ticker.get_annual_reports()
-                return [types.TextContent(type="text", text=df_to_json(df))]
 
-            elif name == "get_credit_ratings":
-                df = ticker.get_credit_ratings()
-                return [types.TextContent(type="text", text=df_to_json(df))]
+@mcp.tool()
+async def get_cash_flow(symbol: str) -> str:
+    """Get cash flow statement for an Indian company."""
+    clear_expired_cache()
+    ticker = get_ticker(symbol)
+    return df_to_json(ticker.get_cash_flow())
 
-            elif name == "get_concalls":
-                df = ticker.get_concalls()
-                return [types.TextContent(type="text", text=df_to_json(df))]
 
-            elif name == "download_documents":
-                doc_type = arguments["doc_type"]
-                folder_path = arguments["folder_path"]
-                link_type = arguments.get("link_type", "all")
-                tab = arguments.get("tab", "recent")
-                year = arguments.get("year")
-                period = arguments.get("period")
-                n = arguments.get("n")
-                downloaded = ticker.download_documents(
-                    doc_type=doc_type,
-                    folder_path=folder_path,
-                    link_type=link_type,
-                    tab=tab,
-                    year=year,
-                    period=period,
-                    n=n
-                )
-                result = {
-                    "symbol": symbol,
-                    "doc_type": doc_type,
-                    "folder_path": folder_path,
-                    "downloaded_count": len(downloaded),
-                    "files": downloaded
-                }
-                return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+@mcp.tool()
+async def get_quarterly_results(symbol: str) -> str:
+    """Get quarterly results for an Indian company from screener.in."""
+    clear_expired_cache()
+    ticker = get_ticker(symbol)
+    return df_to_json(ticker.get_quarterly_results())
 
-            else:
-                raise ValueError(f"Unknown tool: {name}")
-                
-    except TickerNotFound as e:
-        error_msg = {
-            "error": "Ticker not found",
-            "message": str(e),
-            "suggestion": "Please verify the stock symbol is correct and listed on NSE/BSE"
-        }
-        return [types.TextContent(type="text", text=json.dumps(error_msg, indent=2))]
-    except LoginRequiredError as e:
-        error_msg = {
+
+@mcp.tool()
+async def get_shareholding(symbol: str) -> str:
+    """Get shareholding pattern for an Indian company (promoter, institutional, public holdings)."""
+    clear_expired_cache()
+    ticker = get_ticker(symbol)
+    return df_to_json(ticker.get_shareholding())
+
+
+@mcp.tool()
+async def get_peer_comparison(symbol: str) -> str:
+    """Get peer comparison for an Indian company — P/E, market cap, revenue growth vs industry peers."""
+    clear_expired_cache()
+    ticker = get_ticker(symbol)
+    return df_to_json(ticker.get_peer_comparison())
+
+
+# ---------------------------------------------------------------------------
+# Tools — document access (login required)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def get_announcements(
+    symbol: str,
+    tab: Literal["recent", "important"] = "recent"
+) -> str:
+    """
+    Get company announcements for an Indian stock. Login required.
+    Returns title, subtitle, and URL for each announcement.
+    tab: 'recent' (default) or 'important'
+    """
+    clear_expired_cache()
+    ticker = get_ticker(symbol)
+    df = ticker.get_announcements(tab=tab)
+    return df_to_json(df)
+
+
+@mcp.tool()
+async def get_annual_reports(symbol: str) -> str:
+    """Get list of annual reports with download URLs for an Indian stock. Login required."""
+    clear_expired_cache()
+    ticker = get_ticker(symbol)
+    df = ticker.get_annual_reports()
+    return df_to_json(df)
+
+
+@mcp.tool()
+async def get_credit_ratings(symbol: str) -> str:
+    """Get credit rating documents with download URLs for an Indian stock. Login required."""
+    clear_expired_cache()
+    ticker = get_ticker(symbol)
+    df = ticker.get_credit_ratings()
+    return df_to_json(df)
+
+
+@mcp.tool()
+async def get_concalls(symbol: str) -> str:
+    """Get conference call documents (transcripts, PPTs, recordings) for an Indian stock. Login required."""
+    clear_expired_cache()
+    ticker = get_ticker(symbol)
+    df = ticker.get_concalls()
+    return df_to_json(df)
+
+
+@mcp.tool()
+async def download_documents(
+    symbol: str,
+    doc_type: Literal["announcements", "annual_reports", "credit_ratings", "concalls"],
+    folder_path: str,
+    link_type: Literal["transcript", "ppt", "rec", "all"] = "all",
+    tab: Literal["recent", "important"] = "recent",
+    year: Optional[int] = None,
+    period: Optional[str] = None,
+    n: Optional[int] = None
+) -> str:
+    """
+    Batch download company documents to a local folder. Login required.
+    doc_type: 'announcements', 'annual_reports', 'credit_ratings', or 'concalls'
+    link_type: for concalls — 'transcript', 'ppt', 'rec', or 'all'
+    tab: for announcements — 'recent' or 'important'
+    year: for annual_reports — filter by year (e.g. 2023)
+    period: for concalls — filter by period string (e.g. 'Q3 2024')
+    n: max number of documents to download
+    """
+    clear_expired_cache()
+    ticker = get_ticker(symbol)
+    downloaded = ticker.download_documents(
+        doc_type=doc_type,
+        folder_path=folder_path,
+        link_type=link_type,
+        tab=tab,
+        year=year,
+        period=period,
+        n=n
+    )
+    result = {
+        "symbol": symbol.upper(),
+        "doc_type": doc_type,
+        "folder_path": folder_path,
+        "downloaded_count": len(downloaded),
+        "files": downloaded
+    }
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tools — screener
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def screen_stocks(
+    query: str,
+    sort: str = "",
+    order: Literal["asc", "desc"] = "desc",
+    page: int = 1
+) -> str:
+    """
+    Screen Indian stocks based on financial criteria. Login required.
+    query: e.g. 'Piotroski score > 7 AND Return on equity > 15'
+    Supported operators: +, -, /, *, >, <, AND, OR
+    """
+    if not is_logged_in():
+        return json.dumps({
             "error": "Login required",
-            "message": str(e),
-            "instruction": "Set SCREENER_EMAIL and SCREENER_PASSWORD environment variables for automatic login"
-        }
-        return [types.TextContent(type="text", text=json.dumps(error_msg, indent=2))]
-    except Exception as e:
-        import traceback
-        error_msg = {
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }
-        return [types.TextContent(type="text", text=json.dumps(error_msg, indent=2))]
+            "message": "Stock screening requires login to screener.in",
+            "instruction": "Set SCREENER_EMAIL and SCREENER_PASSWORD environment variables and restart the server"
+        }, indent=2)
 
-# Run the server
-async def main():
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream, 
-            server.create_initialization_options()
-        )
+    screener = app_state["sf"].screener()
+    df = screener.load_raw_query(query=query, sort=sort, order=order, page=page)
+    result = {
+        "query": query,
+        "sort": sort,
+        "order": order,
+        "page": page,
+        "total_results": len(df),
+        "results": df.to_dict('records') if not df.empty else []
+    }
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def get_screening_parameters(
+    category: Literal["ratios", "growth", "profitability", "annual", "quarterly",
+                      "balance_sheet", "cash_flow", "price", "all"] = "all"
+) -> str:
+    """
+    Get available parameters for stock screening with descriptions and examples.
+    category: filter by category or 'all' for everything
+    """
+    if category == "all":
+        result = {
+            "parameters": SCREENER_PARAMS,
+            "operators": SCREENER_OPERATORS,
+            "note": "Use exact parameter names in queries. Case sensitive."
+        }
+    elif category in SCREENER_PARAMS:
+        result = {
+            "category": category,
+            "parameters": SCREENER_PARAMS[category],
+            "operators": SCREENER_OPERATORS
+        }
+    else:
+        result = {
+            "error": f"Unknown category: {category}",
+            "available_categories": list(SCREENER_PARAMS.keys()) + ["all"]
+        }
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tools — cache / utility
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def get_cache_stats() -> str:
+    """Get ticker cache statistics and current login status."""
+    cache: dict = app_state.get("ticker_cache", {})
+    now = datetime.now()
+    active = sum(1 for _, t in cache.values()
+                 if now - t < timedelta(hours=CACHE_EXPIRY_HOURS))
+    expired = len(cache) - active
+    return json.dumps({
+        "active_cache_entries": active,
+        "expired_cache_entries": expired,
+        "total_cache_entries": len(cache),
+        "cache_expiry_hours": CACHE_EXPIRY_HOURS,
+        "login_status": is_logged_in()
+    }, indent=2)
+
+
+@mcp.tool()
+async def clear_cache(symbol: Optional[str] = None) -> str:
+    """
+    Clear cached ticker objects to force fresh data on next request.
+    symbol: specific symbol to clear, or omit to clear everything.
+    """
+    cache: dict = app_state.get("ticker_cache", {})
+    if symbol:
+        symbol = symbol.upper()
+        if symbol in cache:
+            del cache[symbol]
+            return json.dumps({"message": f"Cleared cache for {symbol}"}, indent=2)
+        return json.dumps({"message": f"No cache found for {symbol}"}, indent=2)
+    count = len(cache)
+    cache.clear()
+    return json.dumps({"message": f"Cleared all cache ({count} entries)"}, indent=2)
+
+
+@mcp.tool()
+async def check_login_status() -> str:
+    """Check whether the server is logged into screener.in."""
+    logged_in = is_logged_in()
+    return json.dumps({
+        "logged_in": logged_in,
+        "message": "Logged in to screener.in" if logged_in else "Not logged in.",
+        "note": "Set SCREENER_EMAIL and SCREENER_PASSWORD environment variables for automatic login"
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Health check endpoint (HTTP only)
+# ---------------------------------------------------------------------------
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request) -> JSONResponse:
+    return JSONResponse({
+        "status": "ok",
+        "login": is_logged_in(),
+        "cached_tickers": len(app_state.get("ticker_cache", {}))
+    })
+
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+
+@mcp.prompt()
+def high_quality_stocks(
+    min_piotroski_score: str = "7",
+    min_roe: str = "15",
+    max_pe: str = "25"
+) -> str:
+    """Find high quality stocks with strong fundamentals."""
+    query = f"Piotroski score > {min_piotroski_score} AND Return on equity > {min_roe} AND Price to Earning < {max_pe}"
+    return (
+        f"Please screen for high quality stocks using this query: {query}\n\n"
+        f"This will find companies with:\n"
+        f"- Piotroski score > {min_piotroski_score} (financial strength)\n"
+        f"- Return on equity > {min_roe}% (profitability)\n"
+        f"- P/E ratio < {max_pe} (reasonable valuation)"
+    )
+
+
+@mcp.prompt()
+def value_stocks(
+    max_pe: str = "15",
+    max_pb: str = "2",
+    min_dividend_yield: str = "2"
+) -> str:
+    """Find undervalued stocks based on traditional value metrics."""
+    query = f"Price to Earning < {max_pe} AND Price to book value < {max_pb} AND Dividend yield > {min_dividend_yield}"
+    return (
+        f"Please screen for value stocks using this query: {query}\n\n"
+        f"This will find companies with:\n"
+        f"- P/E ratio < {max_pe} (low valuation)\n"
+        f"- Price to book < {max_pb} (trading below book value)\n"
+        f"- Dividend yield > {min_dividend_yield}% (income generating)"
+    )
+
+
+@mcp.prompt()
+def growth_stocks(
+    min_sales_growth: str = "15",
+    min_profit_growth: str = "20",
+    min_roe: str = "15"
+) -> str:
+    """Find growth stocks with strong revenue and profit growth."""
+    query = f"Sales growth 3Years > {min_sales_growth} AND Profit growth 3Years > {min_profit_growth} AND Return on equity > {min_roe}"
+    return (
+        f"Please screen for growth stocks using this query: {query}\n\n"
+        f"This will find companies with:\n"
+        f"- Sales growth > {min_sales_growth}% (3 years)\n"
+        f"- Profit growth > {min_profit_growth}% (3 years)\n"
+        f"- Return on equity > {min_roe}% (efficient capital use)"
+    )
+
+
+@mcp.prompt()
+def custom_screener(criteria: str) -> str:
+    """Build a custom stock screening query from plain-language criteria."""
+    return (
+        f"Based on your criteria: '{criteria}'\n\n"
+        "Please help me build a custom stock screening query. Available parameters:\n\n"
+        "**Financial Ratios**: Price to Earning, Price to book value, Return on equity, "
+        "Return on assets, Debt to equity, Current ratio, Quick ratio\n\n"
+        "**Growth Metrics**: Sales growth 3Years, Profit growth 3Years, EPS growth 3Years, "
+        "Sales growth 5Years\n\n"
+        "**Profitability**: OPM (Operating Profit Margin), NPM (Net Profit Margin), "
+        "Return on capital employed\n\n"
+        "**Quality Scores**: Piotroski score, Earnings yield\n\n"
+        "**Market Data**: Market Capitalization, Dividend yield, Promoter holding\n\n"
+        "**Operators**: >, <, AND, OR\n\n"
+        "Example: 'Return on equity > 20 AND Debt to equity < 0.5 AND Sales growth 3Years > 15'"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description="sfinance MCP server")
+    parser.add_argument(
+        "--transport",
+        default=os.getenv("TRANSPORT", "stdio"),
+        choices=["stdio", "http"],
+        help="Transport mode: 'stdio' (default, for Claude Desktop) or 'http'"
+    )
+    parser.add_argument(
+        "--host",
+        default=os.getenv("HOST", "0.0.0.0"),
+        help="Host to bind to for HTTP transport (default: 0.0.0.0)"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("PORT", "8000")),
+        help="Port for HTTP transport (default: 8000)"
+    )
+    args = parser.parse_args()
+
+    if args.transport == "http":
+        logger.info(f"Starting HTTP server on {args.host}:{args.port}")
+        mcp.run(transport="http", host=args.host, port=args.port)
+    else:
+        logger.info("Starting stdio server")
+        mcp.run()

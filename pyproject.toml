@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11.6"
 dependencies = [
+    "fastmcp>=2.10.0",
     "mcp[cli]>=1.9.4",
     "pandas>=2.3.0",
     "sfinance==0.2.0",

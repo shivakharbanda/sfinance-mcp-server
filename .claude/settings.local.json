@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:gofastmcp.com)",
+      "Bash(uv add:*)",
+      "Bash(cmd.exe /c \"cd C:\\\\Users\\\\shiva\\\\Desktop\\\\personal-projects\\\\sfinance-mcp-server && uv sync 2>&1\")"
+    ]
+  }
+}
